@@ -14,19 +14,18 @@ exports.handler = async (event) => {
     const { url } = JSON.parse(event.body || '{}');
     if (!url) throw new Error("No URL provided");
 
-    // Use unique filenames
     const timestamp = Date.now();
     inPath = path.join(os.tmpdir(), `in_${timestamp}.m4a`);
     outPath = path.join(os.tmpdir(), `out_${timestamp}.mp3`);
 
     console.log('Starting conversion for:', url);
     
-    // Download with shorter timeout and streaming
+    // Download the file
     const downloadStart = Date.now();
     const resp = await axios.get(url, { 
       responseType: 'stream',
-      timeout: 8000, // 8 second download timeout
-      maxContentLength: 50 * 1024 * 1024 // 50MB limit
+      timeout: 15000,
+      maxContentLength: 50 * 1024 * 1024
     });
     
     await new Promise((resolve, reject) => {
@@ -42,12 +41,9 @@ exports.handler = async (event) => {
       
       writeStream.on('error', reject);
       resp.data.on('error', reject);
-      
-      // Additional timeout safety
-      setTimeout(() => reject(new Error('Download timeout')), 9000);
     });
 
-    // Quick file validation
+    // Verify input file
     const inputStats = fs.statSync(inPath);
     if (inputStats.size === 0) {
       throw new Error("Downloaded file is empty");
@@ -56,23 +52,29 @@ exports.handler = async (event) => {
     console.log('Starting FFmpeg conversion...');
     const conversionStart = Date.now();
     
-    // Optimized conversion settings for speed
+    // More explicit FFmpeg conversion
     await new Promise((resolve, reject) => {
       ffmpeg(inPath)
-        .noVideo()
-        .audioCodec('libmp3lame')
-        .audioBitrate('96k')  // Lower bitrate for faster processing
-        .audioFrequency(22050) // Lower frequency for speed
-        .audioChannels(1)     // Mono for speed (remove if stereo needed)
+        .inputFormat('m4a')           // Explicitly set input format
+        .audioCodec('libmp3lame')     // MP3 codec
+        .noVideo()                    // Remove any video streams
+        .audioBitrate('128k')         // Standard bitrate
+        .audioFrequency(44100)        // Standard frequency
+        .audioChannels(2)             // Stereo
+        .format('mp3')                // Explicitly set output format
         .outputOptions([
-          '-ac', '1',         // Mono
-          '-ar', '22050',     // Sample rate
-          '-b:a', '96k',      // Bitrate
-          '-f', 'mp3'         // Force format
+          '-id3v2_version', '3',      // ID3v2.3 tags (more compatible)
+          '-write_id3v1', '1',        // Also write ID3v1 tags
+          '-map', '0:a:0'             // Map only the first audio stream
         ])
         .output(outPath)
         .on('start', (cmd) => {
-          console.log('FFmpeg started:', cmd.substring(0, 100) + '...');
+          console.log('FFmpeg command:', cmd);
+        })
+        .on('progress', (progress) => {
+          if (progress.percent) {
+            console.log(`Progress: ${Math.round(progress.percent)}%`);
+          }
         })
         .on('end', () => {
           const conversionTime = Date.now() - conversionStart;
@@ -81,41 +83,49 @@ exports.handler = async (event) => {
         })
         .on('error', (err) => {
           console.error('FFmpeg error:', err.message);
-          reject(err);
+          reject(new Error(`FFmpeg conversion failed: ${err.message}`));
         })
         .run();
     });
 
-    // Verify output
+    // Verify output file exists and has content
     if (!fs.existsSync(outPath)) {
-      throw new Error("Output file not created");
+      throw new Error("FFmpeg did not create output file");
     }
 
     const outputStats = fs.statSync(outPath);
     if (outputStats.size === 0) {
-      throw new Error("Output file is empty");
+      throw new Error("FFmpeg created empty output file");
+    }
+
+    // Read a few bytes to verify it's actually MP3
+    const buffer = fs.readFileSync(outPath);
+    const firstBytes = buffer.slice(0, 3);
+    
+    // Check for MP3 signatures
+    const isMP3 = (
+      (firstBytes[0] === 0xFF && (firstBytes[1] & 0xE0) === 0xE0) || // MP3 frame header
+      (firstBytes.toString() === 'ID3')                               // ID3 tag
+    );
+
+    if (!isMP3) {
+      console.error('Output file does not appear to be valid MP3');
+      console.error('First 10 bytes:', buffer.slice(0, 10));
+      throw new Error("Conversion produced invalid MP3 file");
     }
 
     const totalTime = Date.now() - startTime;
-    console.log(`Total processing time: ${totalTime}ms, output size: ${outputStats.size} bytes`);
+    console.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes`);
 
-    // Check if we're close to timeout
-    if (totalTime > 20000) { // 20 seconds
-      console.warn('Processing took longer than expected, may timeout');
-    }
-
-    // Read and return
-    const mp3 = fs.readFileSync(outPath);
-    
     return {
       statusCode: 200,
       headers: {
         "Content-Type": "audio/mpeg",
         "Content-Disposition": "attachment; filename=\"converted.mp3\"",
-        "Content-Length": mp3.length.toString(),
+        "Content-Length": buffer.length.toString(),
         "X-Processing-Time": totalTime.toString()
       },
-      body: mp3.toString('base64'),
+      body: buffer.toString('base64'),
       isBase64Encoded: true,
     };
     
@@ -131,7 +141,7 @@ exports.handler = async (event) => {
       }) 
     };
   } finally {
-    // Quick cleanup
+    // Cleanup
     try {
       if (inPath && fs.existsSync(inPath)) fs.unlinkSync(inPath);
       if (outPath && fs.existsSync(outPath)) fs.unlinkSync(outPath);
