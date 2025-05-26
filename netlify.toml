@@ -1,6 +1,6 @@
 [build]
   functions = "functions"
-  command   = "npm install"
+  command = "npm install"
 
-[functions]
+[functions."*"]
   timeout = 26
