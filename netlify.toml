@@ -3,10 +3,4 @@
   command   = "npm install"
 
 [functions]
-  # Increase timeout to maximum allowed (26 seconds for free tier)
   timeout = 26
-
-[[redirects]]
-  from = "/.functions/*"
-  to = "/.functions/:splat"
-  status = 200
