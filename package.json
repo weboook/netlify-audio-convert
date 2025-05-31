@@ -1,17 +1,16 @@
 {
   "name": "netlify-audio-convert",
   "version": "1.0.0",
-  "description": "",
+  "description": "M4A to MP3 converter using static FFmpeg binary",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "postinstall": "node download-ffmpeg.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "axios": "^1.9.0",
-    "@ffmpeg-installer/ffmpeg": "^1.1.0",
-    "fluent-ffmpeg": "^2.1.3"
+    "axios": "^1.9.0"
   }
 }

@@ -3,8 +3,11 @@
   command = "npm install"
 
 [functions]
-  # Global function settings
+  # Use esbuild for better performance
   node_bundler = "esbuild"
+  
+  # Include the FFmpeg binaries in function deployments
+  included_files = ["bin/ffmpeg", "bin/ffprobe"]
 
 [functions."*"]
   # Set timeout to maximum allowed (26 seconds for Netlify)
