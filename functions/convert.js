@@ -2,14 +2,112 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const axios = require('axios');
-const ffmpegPath = require('ffmpeg-static');
-const ffmpeg = require('fluent-ffmpeg');
-ffmpeg.setFfmpegPath(ffmpegPath);
+const { spawn } = require('child_process');
+
+// Try to locate FFmpeg binary
+function getFFmpegPath() {
+  const possiblePaths = [
+    '/opt/bin/ffmpeg',           // Lambda layer
+    '/usr/bin/ffmpeg',           // System install  
+    '/usr/local/bin/ffmpeg',     // Manual install
+    'ffmpeg'                     // PATH fallback
+  ];
+  
+  // First try ffmpeg-static
+  try {
+    const ffmpegStatic = require('ffmpeg-static');
+    if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
+      console.log('Using ffmpeg-static:', ffmpegStatic);
+      return ffmpegStatic;
+    }
+  } catch (e) {
+    console.log('ffmpeg-static not available:', e.message);
+  }
+  
+  // Try system paths
+  for (const testPath of possiblePaths) {
+    try {
+      require('child_process').execSync(`${testPath} -version`, { 
+        stdio: 'pipe',
+        timeout: 3000 
+      });
+      console.log('Found FFmpeg at:', testPath);
+      return testPath;
+    } catch (e) {
+      // Continue to next path
+    }
+  }
+  
+  throw new Error('FFmpeg not found. Please ensure ffmpeg-static is properly installed.');
+}
+
+// Convert using direct spawn for better control
+function convertWithFFmpeg(inputPath, outputPath, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const ffmpegPath = getFFmpegPath();
+    
+    const args = [
+      '-i', inputPath,
+      '-acodec', 'libmp3lame',
+      '-ab', '128k',
+      '-ar', '44100',
+      '-ac', '2',
+      '-f', 'mp3',
+      '-y', // Overwrite output file
+      outputPath
+    ];
+    
+    console.log('Running FFmpeg:', ffmpegPath, args.join(' '));
+    
+    const ffmpegProcess = spawn(ffmpegPath, args, {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    
+    let stdout = '';
+    let stderr = '';
+    
+    ffmpegProcess.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+    
+    ffmpegProcess.stderr.on('data', (data) => {
+      stderr += data.toString();
+      // FFmpeg outputs progress to stderr
+      if (data.toString().includes('time=')) {
+        console.log('FFmpeg progress:', data.toString().trim());
+      }
+    });
+    
+    const timeout = setTimeout(() => {
+      ffmpegProcess.kill('SIGKILL');
+      reject(new Error('FFmpeg conversion timeout'));
+    }, timeoutMs);
+    
+    ffmpegProcess.on('close', (code) => {
+      clearTimeout(timeout);
+      
+      if (code === 0) {
+        console.log('FFmpeg conversion successful');
+        resolve();
+      } else {
+        console.error('FFmpeg failed with code:', code);
+        console.error('FFmpeg stderr:', stderr);
+        reject(new Error(`FFmpeg conversion failed with exit code ${code}: ${stderr}`));
+      }
+    });
+    
+    ffmpegProcess.on('error', (err) => {
+      clearTimeout(timeout);
+      console.error('FFmpeg spawn error:', err);
+      reject(new Error(`FFmpeg spawn failed: ${err.message}`));
+    });
+  });
+}
 
 exports.handler = async (event) => {
   let inPath, outPath;
   const startTime = Date.now();
-  const MAX_PROCESSING_TIME = 20000; // 20 seconds max
+  const MAX_PROCESSING_TIME = 22000; // 22 seconds max to leave buffer
   
   try {
     const { url } = JSON.parse(event.body || '{}');
@@ -21,12 +119,14 @@ exports.handler = async (event) => {
 
     console.log('Starting conversion for:', url);
     
-    // Download the file with stricter limits
+    // Download the file
     const downloadStart = Date.now();
+    console.log('Downloading file...');
+    
     const resp = await axios.get(url, { 
       responseType: 'stream',
-      timeout: 10000, // Reduced timeout
-      maxContentLength: 25 * 1024 * 1024, // Reduced to 25MB max
+      timeout: 8000,
+      maxContentLength: 25 * 1024 * 1024, // 25MB max
       maxRedirects: 3
     });
     
@@ -34,13 +134,13 @@ exports.handler = async (event) => {
       const writeStream = fs.createWriteStream(inPath);
       resp.data.pipe(writeStream);
       
-      const timeout = setTimeout(() => {
+      const downloadTimeout = setTimeout(() => {
         writeStream.destroy();
         reject(new Error('Download timeout'));
-      }, 8000);
+      }, 6000);
       
       writeStream.on('finish', () => {
-        clearTimeout(timeout);
+        clearTimeout(downloadTimeout);
         const downloadTime = Date.now() - downloadStart;
         const fileSize = fs.statSync(inPath).size;
         console.log(`Download completed in ${downloadTime}ms, size: ${fileSize} bytes`);
@@ -48,11 +148,12 @@ exports.handler = async (event) => {
       });
       
       writeStream.on('error', (err) => {
-        clearTimeout(timeout);
+        clearTimeout(downloadTimeout);
         reject(err);
       });
+      
       resp.data.on('error', (err) => {
-        clearTimeout(timeout);
+        clearTimeout(downloadTimeout);
         reject(err);
       });
     });
@@ -63,83 +164,38 @@ exports.handler = async (event) => {
       throw new Error("Downloaded file is empty");
     }
 
-    // Check if we have enough time left for conversion
+    // Check remaining time
     const timeElapsed = Date.now() - startTime;
-    if (timeElapsed > MAX_PROCESSING_TIME * 0.6) {
+    const remainingTime = MAX_PROCESSING_TIME - timeElapsed;
+    
+    if (remainingTime < 5000) {
       throw new Error("Insufficient time remaining for conversion");
     }
 
-    console.log('Starting FFmpeg conversion...');
-    const conversionStart = Date.now();
+    console.log(`Starting conversion with ${remainingTime}ms remaining...`);
     
-    // Optimized FFmpeg conversion with timeout
-    await new Promise((resolve, reject) => {
-      const conversionTimeout = setTimeout(() => {
-        reject(new Error('FFmpeg conversion timeout'));
-      }, MAX_PROCESSING_TIME - timeElapsed - 2000); // Leave 2s buffer
+    // Convert the file
+    await convertWithFFmpeg(inPath, outPath, remainingTime - 2000);
 
-      const ffmpegProcess = ffmpeg(inPath)
-        .inputFormat('m4a')
-        .audioCodec('libmp3lame')
-        .noVideo()
-        .audioBitrate('128k')        // Standard quality
-        .audioFrequency(44100)       
-        .audioChannels(2)            
-        .format('mp3')
-        .outputOptions([
-          '-preset', 'ultrafast',    // Fastest encoding preset
-          '-q:a', '4',              // Good quality/speed balance
-          '-map', '0:a:0'           // Map first audio stream only
-        ])
-        .output(outPath)
-        .on('start', (cmd) => {
-          console.log('FFmpeg command:', cmd);
-        })
-        .on('progress', (progress) => {
-          if (progress.percent) {
-            console.log(`Progress: ${Math.round(progress.percent)}%`);
-          }
-        })
-        .on('end', () => {
-          clearTimeout(conversionTimeout);
-          const conversionTime = Date.now() - conversionStart;
-          console.log(`Conversion completed in ${conversionTime}ms`);
-          resolve();
-        })
-        .on('error', (err) => {
-          clearTimeout(conversionTimeout);
-          console.error('FFmpeg error:', err.message);
-          reject(new Error(`FFmpeg conversion failed: ${err.message}`));
-        });
-
-      ffmpegProcess.run();
-    });
-
-    // Verify output file exists and has content
+    // Verify output
     if (!fs.existsSync(outPath)) {
-      throw new Error("FFmpeg did not create output file");
+      throw new Error("Conversion did not create output file");
     }
 
     const outputStats = fs.statSync(outPath);
     if (outputStats.size === 0) {
-      throw new Error("FFmpeg created empty output file");
+      throw new Error("Conversion created empty output file");
     }
 
-    // Quick validation - just check file size is reasonable
     if (outputStats.size < 1000) {
-      throw new Error("Output file suspiciously small");
+      throw new Error("Output file suspiciously small - conversion may have failed");
     }
 
-    // Read the file
+    // Read and return the file
     const buffer = fs.readFileSync(outPath);
     
     const totalTime = Date.now() - startTime;
     console.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes`);
-
-    // Check if we're approaching timeout
-    if (totalTime > MAX_PROCESSING_TIME * 0.9) {
-      console.warn('Conversion completed close to timeout limit');
-    }
 
     return {
       statusCode: 200,
@@ -158,27 +214,34 @@ exports.handler = async (event) => {
     const totalTime = Date.now() - startTime;
     console.error(`Error after ${totalTime}ms:`, err.message);
     
-    // Return more specific error info
+    // Enhanced error messages
     let errorMessage = err.message;
+    let statusCode = 500;
+    
     if (err.message.includes('timeout') || err.message.includes('Timeout')) {
       errorMessage = "File too large or conversion taking too long. Try a smaller file.";
+      statusCode = 504;
     } else if (err.message.includes('ENOTFOUND') || err.message.includes('network')) {
-      errorMessage = "Could not download the source file. Check the URL.";
+      errorMessage = "Could not download the source file. Check the URL and ensure it's accessible.";
+      statusCode = 400;
+    } else if (err.message.includes('FFmpeg not found') || err.message.includes('spawn')) {
+      errorMessage = "Audio conversion service temporarily unavailable. Please try again later.";
+      statusCode = 503;
     }
     
     return { 
-      statusCode: err.message.includes('timeout') ? 504 : 500,
+      statusCode: statusCode,
       headers: {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ 
         error: errorMessage,
         processingTime: totalTime,
-        originalError: err.message
+        debug: err.message // Keep original error for debugging
       }) 
     };
   } finally {
-    // Cleanup - more aggressive cleanup
+    // Cleanup
     const cleanupFiles = [inPath, outPath];
     for (const filePath of cleanupFiles) {
       try {
