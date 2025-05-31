@@ -217,7 +217,7 @@ async function probeAudioFile(ffprobePath, inputPath, logger) {
 }
 
 // Convert using direct spawn with iOS M4A specific strategies
-function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadata, logger, encoderInfo) {
+function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadata, logger, encoderInfo, inputStats) {
   return new Promise((resolve, reject) => {
     // Detect if this is likely an iOS M4A file
     const isIosM4a = metadata && (
@@ -549,7 +549,7 @@ exports.handler = async (event) => {
     logger.log(`Starting conversion with ${remainingTime}ms remaining...`);
     
     // Convert the file with remaining time and metadata (save 500ms for cleanup)
-    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 500, metadata, logger, encoderInfo);
+    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 500, metadata, logger, encoderInfo, inputStats);
 
     // Verify output (check for any audio file, not just MP3)
     const possibleOutputs = [
@@ -575,7 +575,12 @@ exports.handler = async (event) => {
     if (outputStats.size === 0) {
       throw new Error("Conversion created empty output file");
     }
-    
+
+    const outputStats = fs.statSync(finalOutputPath);
+    if (outputStats.size === 0) {
+      throw new Error("Conversion created empty output file");
+    }
+
     const totalTime = Date.now() - startTime;
     logger.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes, format: ${path.extname(finalOutputPath)}`);
 
