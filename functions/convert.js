@@ -102,22 +102,22 @@ async function testFFmpeg(ffmpegPath) {
   });
 }
 
-// Convert using direct spawn
+// Convert using direct spawn with ultra-fast settings
 function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs) {
   return new Promise((resolve, reject) => {
     const args = [
       '-i', inputPath,
       '-acodec', 'libmp3lame',
-      '-ab', '128k',
-      '-ar', '44100',
-      '-ac', '2',
+      '-ab', '96k',              // Lower bitrate for speed
+      '-ar', '22050',            // Lower sample rate for speed  
+      '-ac', '1',                // Mono for speed
       '-preset', 'ultrafast',
       '-f', 'mp3',
       '-y', // Overwrite output file
       outputPath
     ];
     
-    console.log('Running FFmpeg conversion...');
+    console.log('Running ultra-fast FFmpeg conversion...');
     
     const ffmpegProcess = spawn(ffmpegPath, args, {
       stdio: ['pipe', 'pipe', 'pipe']
@@ -127,11 +127,6 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs) {
     
     ffmpegProcess.stderr.on('data', (data) => {
       stderr += data.toString();
-      // Log progress periodically
-      const progress = data.toString();
-      if (progress.includes('time=')) {
-        console.log('FFmpeg progress:', progress.split('\n')[0].trim());
-      }
     });
     
     const timeout = setTimeout(() => {
@@ -147,7 +142,6 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs) {
         resolve();
       } else {
         console.error('FFmpeg failed with code:', code);
-        console.error('FFmpeg stderr:', stderr.slice(-500)); // Last 500 chars
         reject(new Error(`FFmpeg conversion failed with exit code ${code}`));
       }
     });
@@ -163,14 +157,14 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs) {
 exports.handler = async (event) => {
   let inPath, outPath;
   const startTime = Date.now();
-  const MAX_PROCESSING_TIME = 22000; // 22 seconds max
+  const MAX_PROCESSING_TIME = 8000; // Reduced to 8 seconds to work within 10s limit
   
   try {
-    // Get FFmpeg paths
-    const { ffmpegPath, ffprobePath } = getFFmpegPaths();
+    console.log('Function started, looking for FFmpeg...');
     
-    // Test FFmpeg
-    await testFFmpeg(ffmpegPath);
+    // Get FFmpeg paths quickly
+    const { ffmpegPath, ffprobePath } = getFFmpegPaths();
+    console.log('FFmpeg found, parsing request...');
 
     const { url } = JSON.parse(event.body || '{}');
     if (!url) throw new Error("No URL provided");
@@ -179,17 +173,16 @@ exports.handler = async (event) => {
     inPath = path.join(os.tmpdir(), `in_${timestamp}.m4a`);
     outPath = path.join(os.tmpdir(), `out_${timestamp}.mp3`);
 
-    console.log('Starting conversion for:', url);
+    console.log('Starting download for:', url);
     
-    // Download the file
+    // Download the file with aggressive timeout
     const downloadStart = Date.now();
-    console.log('Downloading file...');
     
     const resp = await axios.get(url, { 
       responseType: 'stream',
-      timeout: 8000,
-      maxContentLength: 25 * 1024 * 1024, // 25MB max
-      maxRedirects: 3,
+      timeout: 4000, // Reduced to 4 seconds
+      maxContentLength: 10 * 1024 * 1024, // Reduced to 10MB max
+      maxRedirects: 2,
       headers: {
         'User-Agent': 'Netlify-Audio-Converter/1.0'
       }
@@ -202,7 +195,7 @@ exports.handler = async (event) => {
       const downloadTimeout = setTimeout(() => {
         writeStream.destroy();
         reject(new Error('Download timeout'));
-      }, 6000);
+      }, 3000); // Reduced to 3 seconds
       
       writeStream.on('finish', () => {
         clearTimeout(downloadTimeout);
@@ -233,14 +226,14 @@ exports.handler = async (event) => {
     const timeElapsed = Date.now() - startTime;
     const remainingTime = MAX_PROCESSING_TIME - timeElapsed;
     
-    if (remainingTime < 5000) {
+    if (remainingTime < 2000) {
       throw new Error("Insufficient time remaining for conversion");
     }
 
     console.log(`Starting conversion with ${remainingTime}ms remaining...`);
     
-    // Convert the file
-    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 2000);
+    // Convert the file with remaining time
+    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 1000);
 
     // Verify output
     if (!fs.existsSync(outPath)) {
@@ -250,10 +243,6 @@ exports.handler = async (event) => {
     const outputStats = fs.statSync(outPath);
     if (outputStats.size === 0) {
       throw new Error("Conversion created empty output file");
-    }
-
-    if (outputStats.size < 1000) {
-      throw new Error("Output file suspiciously small - conversion may have failed");
     }
 
     // Read and return the file
@@ -284,7 +273,7 @@ exports.handler = async (event) => {
     let statusCode = 500;
     
     if (err.message.includes('timeout') || err.message.includes('Timeout')) {
-      errorMessage = "File too large or conversion taking too long. Try a smaller file.";
+      errorMessage = "File too large or conversion taking too long. Try a smaller file (max 10MB).";
       statusCode = 504;
     } else if (err.message.includes('ENOTFOUND') || err.message.includes('network')) {
       errorMessage = "Could not download the source file. Check the URL and ensure it's accessible.";
@@ -315,10 +304,9 @@ exports.handler = async (event) => {
       try {
         if (filePath && fs.existsSync(filePath)) {
           fs.unlinkSync(filePath);
-          console.log('Cleaned up:', filePath);
         }
       } catch (e) {
-        console.error('Cleanup error for', filePath, ':', e.message);
+        // Silent cleanup failure
       }
     }
   }

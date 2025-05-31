@@ -9,7 +9,7 @@
   # Include the FFmpeg binaries in function deployments
   included_files = ["bin/ffmpeg", "bin/ffprobe"]
 
-[functions."*"]
+[functions.convert]
   # Set timeout to maximum allowed (26 seconds for Netlify)
   timeout = 26
   
