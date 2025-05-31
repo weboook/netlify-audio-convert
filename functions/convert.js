@@ -4,8 +4,33 @@ const os = require('os');
 const axios = require('axios');
 const { spawn } = require('child_process');
 
+// Debug logger that collects messages for response
+class DebugLogger {
+  constructor() {
+    this.messages = [];
+  }
+  
+  log(message, data = null) {
+    const timestamp = new Date().toISOString();
+    const logEntry = data ? `${timestamp}: ${message} ${JSON.stringify(data)}` : `${timestamp}: ${message}`;
+    this.messages.push(logEntry);
+    console.log(logEntry); // Still log to console for Netlify logs
+  }
+  
+  error(message, data = null) {
+    const timestamp = new Date().toISOString();
+    const logEntry = data ? `${timestamp}: ERROR - ${message} ${JSON.stringify(data)}` : `${timestamp}: ERROR - ${message}`;
+    this.messages.push(logEntry);
+    console.error(logEntry);
+  }
+  
+  getMessages() {
+    return this.messages;
+  }
+}
+
 // Get FFmpeg paths - either from included binaries or fallback paths
-function getFFmpegPaths() {
+function getFFmpegPaths(logger) {
   const possiblePaths = [
     // First try included binaries
     path.join(__dirname, '..', 'bin', 'ffmpeg'),
@@ -36,7 +61,7 @@ function getFFmpegPaths() {
   for (const testPath of possiblePaths) {
     try {
       if (fs.existsSync(testPath) && fs.statSync(testPath).isFile()) {
-        console.log('Found FFmpeg at:', testPath);
+        logger.log('Found FFmpeg at:', testPath);
         ffmpegPath = testPath;
         break;
       }
@@ -49,7 +74,7 @@ function getFFmpegPaths() {
   for (const testPath of probePaths) {
     try {
       if (fs.existsSync(testPath) && fs.statSync(testPath).isFile()) {
-        console.log('Found FFprobe at:', testPath);
+        logger.log('Found FFprobe at:', testPath);
         ffprobePath = testPath;
         break;
       }
@@ -69,88 +94,239 @@ function getFFmpegPaths() {
   return { ffmpegPath, ffprobePath };
 }
 
-// Test FFmpeg installation
-async function testFFmpeg(ffmpegPath) {
-  return new Promise((resolve, reject) => {
-    const testProcess = spawn(ffmpegPath, ['-version'], {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-
-    let output = '';
-    testProcess.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    testProcess.on('close', (code) => {
-      if (code === 0 && output.includes('ffmpeg version')) {
-        console.log('FFmpeg test successful');
-        resolve();
-      } else {
-        reject(new Error(`FFmpeg test failed with code ${code}`));
-      }
-    });
-
-    testProcess.on('error', (err) => {
-      reject(new Error(`FFmpeg test error: ${err.message}`));
-    });
-
-    // Timeout after 3 seconds
-    setTimeout(() => {
-      testProcess.kill('SIGTERM');
-      reject(new Error('FFmpeg test timeout'));
-    }, 3000);
-  });
-}
-
-// Convert using direct spawn with ultra-fast settings
-function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs) {
+// Probe audio file to get metadata and validate format
+async function probeAudioFile(ffprobePath, inputPath, logger) {
   return new Promise((resolve, reject) => {
     const args = [
-      '-i', inputPath,
-      '-acodec', 'libmp3lame',
-      '-ab', '96k',              // Lower bitrate for speed
-      '-ar', '22050',            // Lower sample rate for speed  
-      '-ac', '1',                // Mono for speed
-      '-preset', 'ultrafast',
-      '-f', 'mp3',
-      '-y', // Overwrite output file
-      outputPath
+      '-v', 'quiet',
+      '-print_format', 'json',
+      '-show_format',
+      '-show_streams',
+      inputPath
     ];
     
-    console.log('Running ultra-fast FFmpeg conversion...');
+    logger.log('Probing audio file for metadata...');
     
-    const ffmpegProcess = spawn(ffmpegPath, args, {
+    const probeProcess = spawn(ffprobePath, args, {
       stdio: ['pipe', 'pipe', 'pipe']
     });
     
+    let stdout = '';
     let stderr = '';
     
-    ffmpegProcess.stderr.on('data', (data) => {
+    probeProcess.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+    
+    probeProcess.stderr.on('data', (data) => {
       stderr += data.toString();
     });
     
     const timeout = setTimeout(() => {
-      ffmpegProcess.kill('SIGKILL');
-      reject(new Error('FFmpeg conversion timeout'));
-    }, timeoutMs);
+      probeProcess.kill('SIGKILL');
+      reject(new Error('FFprobe timeout'));
+    }, 5000);
     
-    ffmpegProcess.on('close', (code) => {
+    probeProcess.on('close', (code) => {
       clearTimeout(timeout);
       
       if (code === 0) {
-        console.log('FFmpeg conversion successful');
-        resolve();
+        try {
+          const metadata = JSON.parse(stdout);
+          logger.log('Audio probe successful:', {
+            format: metadata.format?.format_name,
+            duration: metadata.format?.duration,
+            streams: metadata.streams?.length,
+            codec: metadata.streams?.[0]?.codec_name
+          });
+          resolve(metadata);
+        } catch (parseErr) {
+          reject(new Error(`Failed to parse probe output: ${parseErr.message}`));
+        }
       } else {
-        console.error('FFmpeg failed with code:', code);
-        reject(new Error(`FFmpeg conversion failed with exit code ${code}`));
+        logger.error('FFprobe failed with code:', code);
+        logger.error('FFprobe stderr:', stderr.substring(0, 300));
+        reject(new Error(`Audio file probe failed with exit code ${code}. File may be corrupted or unsupported.`));
       }
     });
     
-    ffmpegProcess.on('error', (err) => {
+    probeProcess.on('error', (err) => {
       clearTimeout(timeout);
-      console.error('FFmpeg spawn error:', err);
-      reject(new Error(`FFmpeg spawn failed: ${err.message}`));
+      reject(new Error(`FFprobe spawn failed: ${err.message}`));
     });
+  });
+}
+
+// Convert using direct spawn with iOS M4A specific strategies
+function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadata, logger) {
+  return new Promise((resolve, reject) => {
+    // Detect if this is likely an iOS M4A file
+    const isIosM4a = metadata && (
+      metadata.format?.format_name?.includes('mov,mp4,m4a') ||
+      metadata.streams?.[0]?.codec_name === 'aac' ||
+      metadata.format?.tags?.['com.apple.finalcutstudio.media.uuid']
+    );
+    
+    logger.log('File analysis:', {
+      isIosM4a,
+      format: metadata?.format?.format_name,
+      codec: metadata?.streams?.[0]?.codec_name
+    });
+
+    // Strategy selection based on file type
+    const strategies = [
+      // Strategy 1: iOS M4A optimized conversion
+      {
+        name: 'ios-m4a-optimized',
+        args: [
+          '-i', inputPath,
+          '-vn', // No video
+          '-acodec', 'libmp3lame',
+          '-ab', '128k',
+          '-ar', '44100',
+          '-ac', '2',
+          '-map', '0:a:0', // Map first audio stream
+          '-avoid_negative_ts', 'make_zero',
+          '-f', 'mp3',
+          '-y',
+          outputPath
+        ]
+      },
+      // Strategy 2: AAC to MP3 specific conversion
+      {
+        name: 'aac-to-mp3',
+        args: [
+          '-i', inputPath,
+          '-c:a', 'libmp3lame',
+          '-b:a', '128k',
+          '-ar', '44100',
+          '-ac', '2',
+          '-movflags', '+faststart',
+          '-f', 'mp3',
+          '-y',
+          outputPath
+        ]
+      },
+      // Strategy 3: Ultra-fast conversion (original)
+      {
+        name: 'ultra-fast',
+        args: [
+          '-i', inputPath,
+          '-acodec', 'libmp3lame',
+          '-ab', '96k',
+          '-ar', '22050',
+          '-ac', '1',
+          '-preset', 'ultrafast',
+          '-f', 'mp3',
+          '-y',
+          outputPath
+        ]
+      },
+      // Strategy 4: Force decode with error recovery
+      {
+        name: 'force-decode',
+        args: [
+          '-err_detect', 'ignore_err',
+          '-i', inputPath,
+          '-c:a', 'libmp3lame',
+          '-b:a', '128k',
+          '-ar', '44100',
+          '-ac', '2',
+          '-strict', '-2',
+          '-threads', '0',
+          '-f', 'mp3',
+          '-y',
+          outputPath
+        ]
+      },
+      // Strategy 5: Raw audio extraction for problematic files
+      {
+        name: 'raw-extraction',
+        args: [
+          '-f', 'mov',
+          '-i', inputPath,
+          '-vn',
+          '-c:a', 'libmp3lame',
+          '-b:a', '128k',
+          '-ar', '44100',
+          '-strict', 'experimental',
+          '-f', 'mp3',
+          '-y',
+          outputPath
+        ]
+      }
+    ];
+
+    // Reorder strategies if iOS M4A detected
+    if (isIosM4a) {
+      logger.log('iOS M4A detected, prioritizing iOS-specific strategies');
+    }
+
+    let currentStrategy = 0;
+    const attemptedStrategies = [];
+
+    function tryConversion() {
+      if (currentStrategy >= strategies.length) {
+        logger.error('All conversion strategies failed', { attemptedStrategies });
+        reject(new Error(`All conversion strategies failed. Attempted: ${attemptedStrategies.join(', ')}`));
+        return;
+      }
+
+      const strategy = strategies[currentStrategy];
+      logger.log(`Trying conversion strategy: ${strategy.name} (${currentStrategy + 1}/${strategies.length})`);
+      attemptedStrategies.push(strategy.name);
+      
+      const ffmpegProcess = spawn(ffmpegPath, strategy.args, {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      
+      let stderr = '';
+      let stdout = '';
+      
+      ffmpegProcess.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+      
+      ffmpegProcess.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+      
+      const timeout = setTimeout(() => {
+        ffmpegProcess.kill('SIGKILL');
+        logger.error(`Strategy ${strategy.name} timed out`);
+        currentStrategy++;
+        setTimeout(tryConversion, 100);
+      }, timeoutMs);
+      
+      ffmpegProcess.on('close', (code) => {
+        clearTimeout(timeout);
+        
+        if (code === 0) {
+          logger.log(`FFmpeg conversion successful with strategy: ${strategy.name}`);
+          resolve();
+        } else {
+          logger.error(`Strategy ${strategy.name} failed with exit code: ${code}`);
+          if (stderr) {
+            logger.error(`Strategy ${strategy.name} stderr:`, stderr.substring(0, 300));
+          }
+          
+          // Try next strategy
+          currentStrategy++;
+          setTimeout(tryConversion, 100);
+        }
+      });
+      
+      ffmpegProcess.on('error', (err) => {
+        clearTimeout(timeout);
+        logger.error(`Strategy ${strategy.name} spawn error:`, err.message);
+        
+        // Try next strategy
+        currentStrategy++;
+        setTimeout(tryConversion, 100);
+      });
+    }
+
+    tryConversion();
   });
 }
 
@@ -181,20 +357,21 @@ function validateBearerToken(event) {
 }
 
 exports.handler = async (event) => {
+  const logger = new DebugLogger();
   let inPath, outPath;
   const startTime = Date.now();
-  const MAX_PROCESSING_TIME = 8000; // Reduced to 8 seconds to work within 10s limit
+  const MAX_PROCESSING_TIME = 12000; // 12 seconds for larger files
   
   try {
-    console.log('Function started, validating authentication...');
+    logger.log('Function started, validating authentication...');
     
     // Validate bearer token first
     validateBearerToken(event);
-    console.log('Authentication successful, looking for FFmpeg...');
+    logger.log('Authentication successful, looking for FFmpeg...');
     
     // Get FFmpeg paths quickly
-    const { ffmpegPath, ffprobePath } = getFFmpegPaths();
-    console.log('FFmpeg found, parsing request...');
+    const { ffmpegPath, ffprobePath } = getFFmpegPaths(logger);
+    logger.log('FFmpeg found, parsing request...');
 
     const { url } = JSON.parse(event.body || '{}');
     if (!url) throw new Error("No URL provided");
@@ -203,15 +380,15 @@ exports.handler = async (event) => {
     inPath = path.join(os.tmpdir(), `in_${timestamp}.m4a`);
     outPath = path.join(os.tmpdir(), `out_${timestamp}.mp3`);
 
-    console.log('Starting download for:', url);
+    logger.log('Starting download for:', url);
     
-    // Download the file with aggressive timeout
+    // Download the file with increased limits
     const downloadStart = Date.now();
     
     const resp = await axios.get(url, { 
       responseType: 'stream',
-      timeout: 4000, // Reduced to 4 seconds
-      maxContentLength: 10 * 1024 * 1024, // Reduced to 10MB max
+      timeout: 8000, // 8 seconds for larger files
+      maxContentLength: 25 * 1024 * 1024, // 25MB max
       maxRedirects: 2,
       headers: {
         'User-Agent': 'Netlify-Audio-Converter/1.0'
@@ -225,13 +402,13 @@ exports.handler = async (event) => {
       const downloadTimeout = setTimeout(() => {
         writeStream.destroy();
         reject(new Error('Download timeout'));
-      }, 3000); // Reduced to 3 seconds
+      }, 6000); // 6 seconds
       
       writeStream.on('finish', () => {
         clearTimeout(downloadTimeout);
         const downloadTime = Date.now() - downloadStart;
         const fileSize = fs.statSync(inPath).size;
-        console.log(`Download completed in ${downloadTime}ms, size: ${fileSize} bytes`);
+        logger.log(`Download completed in ${downloadTime}ms, size: ${fileSize} bytes`);
         resolve();
       });
       
@@ -252,18 +429,27 @@ exports.handler = async (event) => {
       throw new Error("Downloaded file is empty");
     }
 
+    // Probe the audio file to validate format and get metadata
+    let metadata = null;
+    try {
+      metadata = await probeAudioFile(ffprobePath, inPath, logger);
+    } catch (probeErr) {
+      logger.error('Audio probe failed, proceeding with conversion:', probeErr.message);
+      // Continue with conversion even if probe fails
+    }
+
     // Check remaining time
     const timeElapsed = Date.now() - startTime;
     const remainingTime = MAX_PROCESSING_TIME - timeElapsed;
     
-    if (remainingTime < 2000) {
+    if (remainingTime < 3000) {
       throw new Error("Insufficient time remaining for conversion");
     }
 
-    console.log(`Starting conversion with ${remainingTime}ms remaining...`);
+    logger.log(`Starting conversion with ${remainingTime}ms remaining...`);
     
-    // Convert the file with remaining time
-    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 1000);
+    // Convert the file with remaining time and metadata
+    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 1000, metadata, logger);
 
     // Verify output
     if (!fs.existsSync(outPath)) {
@@ -279,7 +465,7 @@ exports.handler = async (event) => {
     const buffer = fs.readFileSync(outPath);
     
     const totalTime = Date.now() - startTime;
-    console.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes`);
+    logger.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes`);
 
     return {
       statusCode: 200,
@@ -288,6 +474,7 @@ exports.handler = async (event) => {
         "Content-Disposition": "attachment; filename=\"converted.mp3\"",
         "Content-Length": buffer.length.toString(),
         "X-Processing-Time": totalTime.toString(),
+        "X-Debug-Messages": JSON.stringify(logger.getMessages()),
         "Cache-Control": "no-cache"
       },
       body: buffer.toString('base64'),
@@ -296,20 +483,20 @@ exports.handler = async (event) => {
     
   } catch (err) {
     const totalTime = Date.now() - startTime;
-    console.error(`Error after ${totalTime}ms:`, err.message);
+    logger.error(`Error after ${totalTime}ms:`, err.message);
     
     // Enhanced error messages
     let errorMessage = err.message;
     let statusCode = 500;
     
     if (err.message.includes('timeout') || err.message.includes('Timeout')) {
-      errorMessage = "File too large or conversion taking too long. Try a smaller file (max 10MB).";
+      errorMessage = "File too large or conversion taking too long. Try a smaller file (max 25MB).";
       statusCode = 504;
     } else if (err.message.includes('ENOTFOUND') || err.message.includes('network')) {
       errorMessage = "Could not download the source file. Check the URL and ensure it's accessible.";
       statusCode = 400;
-    } else if (err.message.includes('FFmpeg') || err.message.includes('ffmpeg')) {
-      errorMessage = "Audio conversion failed. The file may be corrupted or in an unsupported format.";
+    } else if (err.message.includes('FFmpeg') || err.message.includes('ffmpeg') || err.message.includes('conversion strategies failed')) {
+      errorMessage = "Audio conversion failed after trying multiple strategies. The iOS M4A file may have encoding issues or be corrupted. Try re-recording the audio.";
       statusCode = 422;
     } else if (err.message.includes('binary not found')) {
       errorMessage = "Audio conversion service temporarily unavailable. Please try again later.";
@@ -317,17 +504,22 @@ exports.handler = async (event) => {
     } else if (err.message.includes('Authorization') || err.message.includes('authentication') || err.message.includes('Invalid')) {
       errorMessage = "Authentication failed. Please provide a valid bearer token.";
       statusCode = 401;
+    } else if (err.message.includes('probe failed') || err.message.includes('corrupted')) {
+      errorMessage = "iOS M4A file appears to be corrupted or uses an unsupported encoding. Please try re-recording or using a different app.";
+      statusCode = 422;
     }
     
     return { 
       statusCode: statusCode,
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-Debug-Messages": JSON.stringify(logger.getMessages())
       },
       body: JSON.stringify({ 
         error: errorMessage,
         processingTime: totalTime,
-        debug: err.message // Keep original error for debugging
+        debug: err.message,
+        debugMessages: logger.getMessages() // Include debug messages in error response
       }) 
     };
   } finally {
