@@ -575,12 +575,7 @@ exports.handler = async (event) => {
     if (outputStats.size === 0) {
       throw new Error("Conversion created empty output file");
     }
-
-    const outputStats = fs.statSync(finalOutputPath);
-    if (outputStats.size === 0) {
-      throw new Error("Conversion created empty output file");
-    }
-
+    
     const totalTime = Date.now() - startTime;
     logger.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes, format: ${path.extname(finalOutputPath)}`);
 
