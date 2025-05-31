@@ -173,83 +173,53 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadat
       codec: metadata?.streams?.[0]?.codec_name
     });
 
-    // Strategy selection based on file type
+    // Strategy selection based on file type - prioritize fastest strategies
     const strategies = [
-      // Strategy 1: iOS M4A optimized conversion
-      {
-        name: 'ios-m4a-optimized',
-        args: [
-          '-i', inputPath,
-          '-vn', // No video
-          '-acodec', 'libmp3lame',
-          '-ab', '128k',
-          '-ar', '44100',
-          '-ac', '2',
-          '-map', '0:a:0', // Map first audio stream
-          '-avoid_negative_ts', 'make_zero',
-          '-f', 'mp3',
-          '-y',
-          outputPath
-        ]
-      },
-      // Strategy 2: AAC to MP3 specific conversion
-      {
-        name: 'aac-to-mp3',
-        args: [
-          '-i', inputPath,
-          '-c:a', 'libmp3lame',
-          '-b:a', '128k',
-          '-ar', '44100',
-          '-ac', '2',
-          '-movflags', '+faststart',
-          '-f', 'mp3',
-          '-y',
-          outputPath
-        ]
-      },
-      // Strategy 3: Ultra-fast conversion (original)
+      // Strategy 1: Ultra-fast conversion for speed (moved to first)
       {
         name: 'ultra-fast',
         args: [
           '-i', inputPath,
           '-acodec', 'libmp3lame',
+          '-ab', '64k',              // Even lower bitrate for speed
+          '-ar', '16000',            // Lower sample rate for maximum speed
+          '-ac', '1',                // Mono for speed
+          '-preset', 'ultrafast',
+          '-threads', '0',           // Use all available threads
+          '-f', 'mp3',
+          '-y',
+          outputPath
+        ]
+      },
+      // Strategy 2: iOS M4A optimized but fast
+      {
+        name: 'ios-m4a-fast',
+        args: [
+          '-i', inputPath,
+          '-vn', // No video
+          '-acodec', 'libmp3lame',
           '-ab', '96k',
           '-ar', '22050',
           '-ac', '1',
+          '-map', '0:a:0', // Map first audio stream
+          '-threads', '0',
           '-preset', 'ultrafast',
           '-f', 'mp3',
           '-y',
           outputPath
         ]
       },
-      // Strategy 4: Force decode with error recovery
+      // Strategy 3: AAC to MP3 fast conversion
       {
-        name: 'force-decode',
+        name: 'aac-to-mp3-fast',
         args: [
-          '-err_detect', 'ignore_err',
           '-i', inputPath,
           '-c:a', 'libmp3lame',
-          '-b:a', '128k',
-          '-ar', '44100',
-          '-ac', '2',
-          '-strict', '-2',
+          '-b:a', '96k',
+          '-ar', '22050',
+          '-ac', '1',
           '-threads', '0',
-          '-f', 'mp3',
-          '-y',
-          outputPath
-        ]
-      },
-      // Strategy 5: Raw audio extraction for problematic files
-      {
-        name: 'raw-extraction',
-        args: [
-          '-f', 'mov',
-          '-i', inputPath,
-          '-vn',
-          '-c:a', 'libmp3lame',
-          '-b:a', '128k',
-          '-ar', '44100',
-          '-strict', 'experimental',
+          '-preset', 'ultrafast',
           '-f', 'mp3',
           '-y',
           outputPath
@@ -360,7 +330,7 @@ exports.handler = async (event) => {
   const logger = new DebugLogger();
   let inPath, outPath;
   const startTime = Date.now();
-  const MAX_PROCESSING_TIME = 12000; // 12 seconds for larger files
+  const MAX_PROCESSING_TIME = 9000; // Reduced to 9 seconds to stay under Netlify's 10s limit
   
   try {
     logger.log('Function started, validating authentication...');
@@ -387,8 +357,8 @@ exports.handler = async (event) => {
     
     const resp = await axios.get(url, { 
       responseType: 'stream',
-      timeout: 8000, // 8 seconds for larger files
-      maxContentLength: 25 * 1024 * 1024, // 25MB max
+      timeout: 4000, // Reduced to 4 seconds
+      maxContentLength: 25 * 1024 * 1024, // Keep 25MB but with faster processing
       maxRedirects: 2,
       headers: {
         'User-Agent': 'Netlify-Audio-Converter/1.0'
@@ -402,7 +372,7 @@ exports.handler = async (event) => {
       const downloadTimeout = setTimeout(() => {
         writeStream.destroy();
         reject(new Error('Download timeout'));
-      }, 6000); // 6 seconds
+      }, 3000); // Reduced to 3 seconds
       
       writeStream.on('finish', () => {
         clearTimeout(downloadTimeout);
@@ -438,18 +408,18 @@ exports.handler = async (event) => {
       // Continue with conversion even if probe fails
     }
 
-    // Check remaining time
+    // Check remaining time - need at least 2 seconds for conversion
     const timeElapsed = Date.now() - startTime;
     const remainingTime = MAX_PROCESSING_TIME - timeElapsed;
     
-    if (remainingTime < 3000) {
-      throw new Error("Insufficient time remaining for conversion");
+    if (remainingTime < 2000) {
+      throw new Error("Insufficient time remaining for conversion. File may be too large for processing within time limits.");
     }
 
     logger.log(`Starting conversion with ${remainingTime}ms remaining...`);
     
-    // Convert the file with remaining time and metadata
-    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 1000, metadata, logger);
+    // Convert the file with remaining time and metadata (save 500ms for cleanup)
+    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 500, metadata, logger);
 
     // Verify output
     if (!fs.existsSync(outPath)) {
@@ -489,8 +459,8 @@ exports.handler = async (event) => {
     let errorMessage = err.message;
     let statusCode = 500;
     
-    if (err.message.includes('timeout') || err.message.includes('Timeout')) {
-      errorMessage = "File too large or conversion taking too long. Try a smaller file (max 25MB).";
+    if (err.message.includes('timeout') || err.message.includes('Timeout') || err.message.includes('Timedout')) {
+      errorMessage = "Processing timeout. File too large or complex for 10-second limit. Try a smaller file (max 25MB) or shorter audio.";
       statusCode = 504;
     } else if (err.message.includes('ENOTFOUND') || err.message.includes('network')) {
       errorMessage = "Could not download the source file. Check the URL and ensure it's accessible.";
