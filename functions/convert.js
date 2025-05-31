@@ -154,13 +154,43 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs) {
   });
 }
 
+// Validate bearer token
+function validateBearerToken(event) {
+  const authHeader = event.headers.authorization || event.headers.Authorization;
+  
+  if (!authHeader) {
+    throw new Error("Missing Authorization header");
+  }
+  
+  if (!authHeader.startsWith('Bearer ')) {
+    throw new Error("Invalid authorization format. Use 'Bearer <token>'");
+  }
+  
+  const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+  const validToken = process.env.API_TOKEN;
+  
+  if (!validToken) {
+    throw new Error("Server configuration error: API token not set");
+  }
+  
+  if (token !== validToken) {
+    throw new Error("Invalid authentication token");
+  }
+  
+  return true;
+}
+
 exports.handler = async (event) => {
   let inPath, outPath;
   const startTime = Date.now();
   const MAX_PROCESSING_TIME = 8000; // Reduced to 8 seconds to work within 10s limit
   
   try {
-    console.log('Function started, looking for FFmpeg...');
+    console.log('Function started, validating authentication...');
+    
+    // Validate bearer token first
+    validateBearerToken(event);
+    console.log('Authentication successful, looking for FFmpeg...');
     
     // Get FFmpeg paths quickly
     const { ffmpegPath, ffprobePath } = getFFmpegPaths();
@@ -284,6 +314,9 @@ exports.handler = async (event) => {
     } else if (err.message.includes('binary not found')) {
       errorMessage = "Audio conversion service temporarily unavailable. Please try again later.";
       statusCode = 503;
+    } else if (err.message.includes('Authorization') || err.message.includes('authentication') || err.message.includes('Invalid')) {
+      errorMessage = "Authentication failed. Please provide a valid bearer token.";
+      statusCode = 401;
     }
     
     return { 
