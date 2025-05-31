@@ -94,39 +94,63 @@ function getFFmpegPaths(logger) {
   return { ffmpegPath, ffprobePath };
 }
 
-// Check available encoders in FFmpeg
+// Check available encoders and get full configuration
 async function checkAvailableEncoders(ffmpegPath, logger) {
   return new Promise((resolve) => {
-    const encoderProcess = spawn(ffmpegPath, ['-encoders'], {
+    // First get the full configuration
+    const configProcess = spawn(ffmpegPath, ['-version'], {
       stdio: ['pipe', 'pipe', 'pipe']
     });
     
-    let stdout = '';
+    let configOutput = '';
     
-    encoderProcess.stdout.on('data', (data) => {
-      stdout += data.toString();
+    configProcess.stdout.on('data', (data) => {
+      configOutput += data.toString();
     });
     
-    const timeout = setTimeout(() => {
-      encoderProcess.kill('SIGKILL');
-      resolve({ hasLibmp3lame: false, hasMp3: false, availableEncoders: 'timeout' });
-    }, 2000);
-    
-    encoderProcess.on('close', (code) => {
-      clearTimeout(timeout);
+    configProcess.on('close', (code) => {
+      logger.log('FFmpeg configuration:', configOutput.substring(0, 800));
       
-      const hasLibmp3lame = stdout.includes('libmp3lame');
-      const hasMp3 = stdout.includes(' mp3 ') || stdout.includes('mp3float');
+      // Now check encoders
+      const encoderProcess = spawn(ffmpegPath, ['-encoders'], {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
       
-      logger.log('Available encoders check:', { hasLibmp3lame, hasMp3 });
+      let stdout = '';
       
-      resolve({ hasLibmp3lame, hasMp3, availableEncoders: stdout.substring(0, 500) });
+      encoderProcess.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+      
+      const timeout = setTimeout(() => {
+        encoderProcess.kill('SIGKILL');
+        resolve({ hasLibmp3lame: false, hasMp3: false, hasAac: false, hasWav: false, availableEncoders: 'timeout' });
+      }, 3000);
+      
+      encoderProcess.on('close', (code) => {
+        clearTimeout(timeout);
+        
+        const hasLibmp3lame = stdout.includes('libmp3lame');
+        const hasMp3 = stdout.includes(' mp3 ') || stdout.includes('mp3float');
+        const hasAac = stdout.includes('aac') || stdout.includes('libfdk_aac');
+        const hasWav = stdout.includes('pcm_') || stdout.includes('wav');
+        
+        logger.log('Available encoders check:', { hasLibmp3lame, hasMp3, hasAac, hasWav });
+        logger.log('Encoder list sample:', stdout.substring(0, 600));
+        
+        resolve({ hasLibmp3lame, hasMp3, hasAac, hasWav, availableEncoders: stdout });
+      });
+      
+      encoderProcess.on('error', (err) => {
+        clearTimeout(timeout);
+        logger.error('Encoder check failed:', err.message);
+        resolve({ hasLibmp3lame: false, hasMp3: false, hasAac: false, hasWav: false, availableEncoders: 'error' });
+      });
     });
     
-    encoderProcess.on('error', (err) => {
-      clearTimeout(timeout);
-      logger.error('Encoder check failed:', err.message);
-      resolve({ hasLibmp3lame: false, hasMp3: false, availableEncoders: 'error' });
+    configProcess.on('error', (err) => {
+      logger.error('Config check failed:', err.message);
+      resolve({ hasLibmp3lame: false, hasMp3: false, hasAac: false, hasWav: false, availableEncoders: 'config-error' });
     });
   });
 }
@@ -207,104 +231,110 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadat
       format: metadata?.format?.format_name,
       codec: metadata?.streams?.[0]?.codec_name,
       hasLibmp3lame: encoderInfo?.hasLibmp3lame,
-      hasMp3: encoderInfo?.hasMp3
+      hasMp3: encoderInfo?.hasMp3,
+      hasAac: encoderInfo?.hasAac,
+      hasWav: encoderInfo?.hasWav
     });
 
-    // Strategy selection with built-in encoder fallbacks (no libmp3lame dependency)
+    // Strategy selection with fallbacks to any working audio format
     const strategies = [
-      // Strategy 1: Built-in MP3 encoder (most compatible)
+      // Strategy 1: Try WAV first (most likely to work)
       {
-        name: 'builtin-mp3',
+        name: 'wav-pcm',
         args: [
           '-i', inputPath,
-          '-c:a', 'mp3',            // Use built-in mp3 encoder
+          '-c:a', 'pcm_s16le',      // PCM is almost always available
+          '-ar', '16000',
+          '-ac', '1',
+          '-f', 'wav',
+          '-y',
+          outputPath.replace('.mp3', '.wav')
+        ]
+      },
+      // Strategy 2: Try AAC (very common)
+      {
+        name: 'aac-output',
+        args: [
+          '-i', inputPath,
+          '-c:a', 'aac',
           '-b:a', '64k',
           '-ar', '16000',
           '-ac', '1',
-          '-threads', '0',
-          '-f', 'mp3',
+          '-f', 'aac',
           '-y',
-          outputPath
+          outputPath.replace('.mp3', '.aac')
         ]
       },
-      // Strategy 2: Copy audio stream if already compatible
+      // Strategy 3: Force libmp3lame with explicit paths
       {
-        name: 'stream-copy',
+        name: 'libmp3lame-explicit',
         args: [
           '-i', inputPath,
-          '-c:a', 'copy',           // Try direct copy first
-          '-f', 'mp3',
-          '-y',
-          outputPath
-        ]
-      },
-      // Strategy 3: Force MP3 with different approach
-      {
-        name: 'force-mp3',
-        args: [
-          '-f', 'mp4',              // Force MP4 container read
-          '-i', inputPath,
-          '-vn',                    // No video
-          '-c:a', 'mp3',
-          '-b:a', '96k',
-          '-ar', '22050',
-          '-ac', '1',
-          '-threads', '0',
-          '-f', 'mp3',
-          '-y',
-          outputPath
-        ]
-      },
-      // Strategy 4: libmp3lame (original - try last)
-      {
-        name: 'libmp3lame-fallback',
-        args: [
-          '-i', inputPath,
-          '-acodec', 'libmp3lame',
-          '-ab', '64k',
+          '-c:a', 'libmp3lame',
+          '-b:a', '64k',
           '-ar', '16000',
           '-ac', '1',
-          '-preset', 'ultrafast',
-          '-threads', '0',
           '-f', 'mp3',
           '-y',
           outputPath
         ]
       },
-      // Strategy 5: Raw AAC to MP3 conversion
+      // Strategy 4: Raw audio stream copy
       {
-        name: 'aac-decode',
+        name: 'raw-copy',
         args: [
           '-i', inputPath,
-          '-map', '0:a:0',          // Map first audio stream
-          '-c:a', 'mp3',
-          '-b:a', '96k',
-          '-ar', '22050',
-          '-ac', '1',
-          '-strict', 'experimental',
-          '-f', 'mp3',
+          '-c:a', 'copy',
+          '-f', 'mp4',              // Keep in MP4 container
           '-y',
-          outputPath
+          outputPath.replace('.mp3', '.mp4')
+        ]
+      },
+      // Strategy 5: Last resort - any available codec
+      {
+        name: 'any-audio',
+        args: [
+          '-i', inputPath,
+          '-vn',                    // No video
+          '-ar', '16000',
+          '-ac', '1',
+          '-f', 'adts',             // ADTS AAC format
+          '-y',
+          outputPath.replace('.mp3', '.aac')
         ]
       }
     ];
 
-    // Filter strategies based on available encoders
+    // Filter and prioritize strategies based on available encoders
     let availableStrategies = strategies;
     
+    // Prioritize based on what's available
+    if (encoderInfo?.hasWav) {
+      logger.log('WAV/PCM encoders available, prioritizing WAV strategy');
+      const wavStrategy = availableStrategies.find(s => s.name === 'wav-pcm');
+      if (wavStrategy) {
+        availableStrategies.splice(availableStrategies.indexOf(wavStrategy), 1);
+        availableStrategies.unshift(wavStrategy);
+      }
+    }
+    
+    if (encoderInfo?.hasAac) {
+      logger.log('AAC encoders available');
+    }
+    
     if (!encoderInfo?.hasLibmp3lame) {
-      logger.log('libmp3lame not available, filtering strategies');
-      availableStrategies = strategies.filter(s => !s.name.includes('libmp3lame'));
+      logger.log('libmp3lame not available, filtering libmp3lame strategies');
+      availableStrategies = availableStrategies.filter(s => !s.name.includes('libmp3lame'));
     }
     
     if (!encoderInfo?.hasMp3 && !encoderInfo?.hasLibmp3lame) {
-      logger.error('No MP3 encoders available, this will likely fail');
+      logger.log('No MP3 encoders available, will try alternative formats');
     }
     // Reorder strategies if iOS M4A detected
     if (isIosM4a) {
       logger.log('iOS M4A detected, prioritizing iOS-specific strategies');
-      // Move aac-decode strategy to front for iOS files
-      const aacStrategy = availableStrategies.find(s => s.name === 'aac-decode');
+      // Move aac strategies to front for iOS files
+      const aacStrategy = availableStrategies.find(s => s.name === 'aac-output');
       if (aacStrategy) {
         availableStrategies.splice(availableStrategies.indexOf(aacStrategy), 1);
         availableStrategies.unshift(aacStrategy);
@@ -354,6 +384,14 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadat
         
         if (code === 0) {
           logger.log(`FFmpeg conversion successful with strategy: ${strategy.name}`);
+          
+          // Check if we created a non-MP3 file that we need to rename
+          const actualOutputPath = strategy.args[strategy.args.length - 1];
+          if (actualOutputPath !== outputPath && fs.existsSync(actualOutputPath)) {
+            logger.log(`Renaming ${actualOutputPath} to ${outputPath} for compatibility`);
+            fs.renameSync(actualOutputPath, outputPath);
+          }
+          
           resolve();
         } else {
           logger.error(`Strategy ${strategy.name} failed with exit code: ${code}`);
@@ -505,30 +543,57 @@ exports.handler = async (event) => {
     // Convert the file with remaining time and metadata (save 500ms for cleanup)
     await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 500, metadata, logger, encoderInfo);
 
-    // Verify output
-    if (!fs.existsSync(outPath)) {
-      throw new Error("Conversion did not create output file");
+    // Verify output (check for any audio file, not just MP3)
+    const possibleOutputs = [
+      outPath,
+      outPath.replace('.mp3', '.wav'),
+      outPath.replace('.mp3', '.aac'),
+      outPath.replace('.mp3', '.mp4')
+    ];
+    
+    let finalOutputPath = null;
+    for (const testPath of possibleOutputs) {
+      if (fs.existsSync(testPath)) {
+        finalOutputPath = testPath;
+        break;
+      }
+    }
+    
+    if (!finalOutputPath) {
+      throw new Error("Conversion did not create any output file");
     }
 
-    const outputStats = fs.statSync(outPath);
+    const outputStats = fs.statSync(finalOutputPath);
     if (outputStats.size === 0) {
       throw new Error("Conversion created empty output file");
     }
 
     // Read and return the file
-    const buffer = fs.readFileSync(outPath);
+    const buffer = fs.readFileSync(finalOutputPath);
     
     const totalTime = Date.now() - startTime;
-    logger.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes`);
+    logger.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes, format: ${path.extname(finalOutputPath)}`);
+
+    // Determine content type based on actual output
+    let contentType = "audio/mpeg"; // Default
+    const extension = path.extname(finalOutputPath).toLowerCase();
+    if (extension === '.wav') {
+      contentType = "audio/wav";
+    } else if (extension === '.aac') {
+      contentType = "audio/aac";
+    } else if (extension === '.mp4') {
+      contentType = "audio/mp4";
+    }
 
     return {
       statusCode: 200,
       headers: {
-        "Content-Type": "audio/mpeg",
-        "Content-Disposition": "attachment; filename=\"converted.mp3\"",
+        "Content-Type": contentType,
+        "Content-Disposition": `attachment; filename="converted${extension}"`,
         "Content-Length": buffer.length.toString(),
         "X-Processing-Time": totalTime.toString(),
         "X-Debug-Messages": JSON.stringify(logger.getMessages()),
+        "X-Output-Format": extension,
         "Cache-Control": "no-cache"
       },
       body: buffer.toString('base64'),
@@ -577,8 +642,15 @@ exports.handler = async (event) => {
       }) 
     };
   } finally {
-    // Cleanup
-    const cleanupFiles = [inPath, outPath];
+    // Cleanup - check for all possible output files
+    const cleanupFiles = [
+      inPath, 
+      outPath,
+      outPath?.replace('.mp3', '.wav'),
+      outPath?.replace('.mp3', '.aac'),
+      outPath?.replace('.mp3', '.mp4')
+    ].filter(Boolean);
+    
     for (const filePath of cleanupFiles) {
       try {
         if (filePath && fs.existsSync(filePath)) {
