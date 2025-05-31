@@ -2,114 +2,49 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const axios = require('axios');
-const { spawn } = require('child_process');
+const ffmpeg = require('fluent-ffmpeg');
 
-// Try to locate FFmpeg binary
-function getFFmpegPath() {
-  const possiblePaths = [
-    '/opt/bin/ffmpeg',           // Lambda layer
-    '/usr/bin/ffmpeg',           // System install  
-    '/usr/local/bin/ffmpeg',     // Manual install
-    'ffmpeg'                     // PATH fallback
-  ];
-  
-  // First try ffmpeg-static
-  try {
-    const ffmpegStatic = require('ffmpeg-static');
-    if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
-      console.log('Using ffmpeg-static:', ffmpegStatic);
-      return ffmpegStatic;
-    }
-  } catch (e) {
-    console.log('ffmpeg-static not available:', e.message);
-  }
-  
-  // Try system paths
-  for (const testPath of possiblePaths) {
-    try {
-      require('child_process').execSync(`${testPath} -version`, { 
-        stdio: 'pipe',
-        timeout: 3000 
-      });
-      console.log('Found FFmpeg at:', testPath);
-      return testPath;
-    } catch (e) {
-      // Continue to next path
-    }
-  }
-  
-  throw new Error('FFmpeg not found. Please ensure ffmpeg-static is properly installed.');
-}
-
-// Convert using direct spawn for better control
-function convertWithFFmpeg(inputPath, outputPath, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const ffmpegPath = getFFmpegPath();
-    
-    const args = [
-      '-i', inputPath,
-      '-acodec', 'libmp3lame',
-      '-ab', '128k',
-      '-ar', '44100',
-      '-ac', '2',
-      '-f', 'mp3',
-      '-y', // Overwrite output file
-      outputPath
-    ];
-    
-    console.log('Running FFmpeg:', ffmpegPath, args.join(' '));
-    
-    const ffmpegProcess = spawn(ffmpegPath, args, {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    
-    let stdout = '';
-    let stderr = '';
-    
-    ffmpegProcess.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-    
-    ffmpegProcess.stderr.on('data', (data) => {
-      stderr += data.toString();
-      // FFmpeg outputs progress to stderr
-      if (data.toString().includes('time=')) {
-        console.log('FFmpeg progress:', data.toString().trim());
-      }
-    });
-    
-    const timeout = setTimeout(() => {
-      ffmpegProcess.kill('SIGKILL');
-      reject(new Error('FFmpeg conversion timeout'));
-    }, timeoutMs);
-    
-    ffmpegProcess.on('close', (code) => {
-      clearTimeout(timeout);
-      
-      if (code === 0) {
-        console.log('FFmpeg conversion successful');
-        resolve();
-      } else {
-        console.error('FFmpeg failed with code:', code);
-        console.error('FFmpeg stderr:', stderr);
-        reject(new Error(`FFmpeg conversion failed with exit code ${code}: ${stderr}`));
-      }
-    });
-    
-    ffmpegProcess.on('error', (err) => {
-      clearTimeout(timeout);
-      console.error('FFmpeg spawn error:', err);
-      reject(new Error(`FFmpeg spawn failed: ${err.message}`));
-    });
-  });
+// Use @ffmpeg-installer instead of ffmpeg-static
+let ffmpegPath;
+try {
+  ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
+  console.log('Using @ffmpeg-installer, FFmpeg path:', ffmpegPath);
+  ffmpeg.setFfmpegPath(ffmpegPath);
+} catch (error) {
+  console.error('Failed to load @ffmpeg-installer:', error.message);
+  throw new Error('FFmpeg installer not available. Please ensure @ffmpeg-installer/ffmpeg is installed.');
 }
 
 exports.handler = async (event) => {
   let inPath, outPath;
   const startTime = Date.now();
-  const MAX_PROCESSING_TIME = 22000; // 22 seconds max to leave buffer
+  const MAX_PROCESSING_TIME = 22000; // 22 seconds max
   
   try {
+    // Verify FFmpeg is working
+    try {
+      console.log('Testing FFmpeg installation...');
+      await new Promise((resolve, reject) => {
+        const testTimeout = setTimeout(() => {
+          reject(new Error('FFmpeg test timeout'));
+        }, 3000);
+        
+        ffmpeg.ffprobe('-version', (err, data) => {
+          clearTimeout(testTimeout);
+          if (err) {
+            console.error('FFmpeg test failed:', err.message);
+            reject(err);
+          } else {
+            console.log('FFmpeg test successful');
+            resolve(data);
+          }
+        });
+      });
+    } catch (testError) {
+      console.error('FFmpeg verification failed:', testError.message);
+      throw new Error(`FFmpeg is not working: ${testError.message}`);
+    }
+
     const { url } = JSON.parse(event.body || '{}');
     if (!url) throw new Error("No URL provided");
 
@@ -127,7 +62,10 @@ exports.handler = async (event) => {
       responseType: 'stream',
       timeout: 8000,
       maxContentLength: 25 * 1024 * 1024, // 25MB max
-      maxRedirects: 3
+      maxRedirects: 3,
+      headers: {
+        'User-Agent': 'Netlify-Audio-Converter/1.0'
+      }
     });
     
     await new Promise((resolve, reject) => {
@@ -173,9 +111,49 @@ exports.handler = async (event) => {
     }
 
     console.log(`Starting conversion with ${remainingTime}ms remaining...`);
+    const conversionStart = Date.now();
     
-    // Convert the file
-    await convertWithFFmpeg(inPath, outPath, remainingTime - 2000);
+    // Convert using fluent-ffmpeg with optimized settings
+    await new Promise((resolve, reject) => {
+      const conversionTimeout = setTimeout(() => {
+        reject(new Error('FFmpeg conversion timeout'));
+      }, remainingTime - 2000); // Leave 2s buffer
+
+      ffmpeg(inPath)
+        .inputFormat('m4a')
+        .audioCodec('libmp3lame')
+        .noVideo()
+        .audioBitrate('128k')
+        .audioFrequency(44100)
+        .audioChannels(2)
+        .format('mp3')
+        .outputOptions([
+          '-preset', 'ultrafast',    // Fastest encoding
+          '-q:a', '4',              // Good quality/speed balance
+          '-map', '0:a:0'           // Map first audio stream only
+        ])
+        .output(outPath)
+        .on('start', (cmd) => {
+          console.log('FFmpeg command:', cmd);
+        })
+        .on('progress', (progress) => {
+          if (progress.percent) {
+            console.log(`Progress: ${Math.round(progress.percent)}%`);
+          }
+        })
+        .on('end', () => {
+          clearTimeout(conversionTimeout);
+          const conversionTime = Date.now() - conversionStart;
+          console.log(`Conversion completed in ${conversionTime}ms`);
+          resolve();
+        })
+        .on('error', (err) => {
+          clearTimeout(conversionTimeout);
+          console.error('FFmpeg error:', err.message);
+          reject(new Error(`FFmpeg conversion failed: ${err.message}`));
+        })
+        .run();
+    });
 
     // Verify output
     if (!fs.existsSync(outPath)) {
@@ -224,7 +202,10 @@ exports.handler = async (event) => {
     } else if (err.message.includes('ENOTFOUND') || err.message.includes('network')) {
       errorMessage = "Could not download the source file. Check the URL and ensure it's accessible.";
       statusCode = 400;
-    } else if (err.message.includes('FFmpeg not found') || err.message.includes('spawn')) {
+    } else if (err.message.includes('FFmpeg') || err.message.includes('ffmpeg')) {
+      errorMessage = "Audio conversion failed. The file may be corrupted or in an unsupported format.";
+      statusCode = 422;
+    } else if (err.message.includes('installer')) {
       errorMessage = "Audio conversion service temporarily unavailable. Please try again later.";
       statusCode = 503;
     }
