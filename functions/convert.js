@@ -94,7 +94,42 @@ function getFFmpegPaths(logger) {
   return { ffmpegPath, ffprobePath };
 }
 
-// Probe audio file to get metadata and validate format
+// Check available encoders in FFmpeg
+async function checkAvailableEncoders(ffmpegPath, logger) {
+  return new Promise((resolve) => {
+    const encoderProcess = spawn(ffmpegPath, ['-encoders'], {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    
+    let stdout = '';
+    
+    encoderProcess.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+    
+    const timeout = setTimeout(() => {
+      encoderProcess.kill('SIGKILL');
+      resolve({ hasLibmp3lame: false, hasMp3: false, availableEncoders: 'timeout' });
+    }, 2000);
+    
+    encoderProcess.on('close', (code) => {
+      clearTimeout(timeout);
+      
+      const hasLibmp3lame = stdout.includes('libmp3lame');
+      const hasMp3 = stdout.includes(' mp3 ') || stdout.includes('mp3float');
+      
+      logger.log('Available encoders check:', { hasLibmp3lame, hasMp3 });
+      
+      resolve({ hasLibmp3lame, hasMp3, availableEncoders: stdout.substring(0, 500) });
+    });
+    
+    encoderProcess.on('error', (err) => {
+      clearTimeout(timeout);
+      logger.error('Encoder check failed:', err.message);
+      resolve({ hasLibmp3lame: false, hasMp3: false, availableEncoders: 'error' });
+    });
+  });
+}
 async function probeAudioFile(ffprobePath, inputPath, logger) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -158,7 +193,7 @@ async function probeAudioFile(ffprobePath, inputPath, logger) {
 }
 
 // Convert using direct spawn with iOS M4A specific strategies
-function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadata, logger) {
+function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadata, logger, encoderInfo) {
   return new Promise((resolve, reject) => {
     // Detect if this is likely an iOS M4A file
     const isIosM4a = metadata && (
@@ -170,56 +205,83 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadat
     logger.log('File analysis:', {
       isIosM4a,
       format: metadata?.format?.format_name,
-      codec: metadata?.streams?.[0]?.codec_name
+      codec: metadata?.streams?.[0]?.codec_name,
+      hasLibmp3lame: encoderInfo?.hasLibmp3lame,
+      hasMp3: encoderInfo?.hasMp3
     });
 
-    // Strategy selection based on file type - prioritize fastest strategies
+    // Strategy selection with built-in encoder fallbacks (no libmp3lame dependency)
     const strategies = [
-      // Strategy 1: Ultra-fast conversion for speed (moved to first)
+      // Strategy 1: Built-in MP3 encoder (most compatible)
       {
-        name: 'ultra-fast',
+        name: 'builtin-mp3',
         args: [
           '-i', inputPath,
-          '-acodec', 'libmp3lame',
-          '-ab', '64k',              // Even lower bitrate for speed
-          '-ar', '16000',            // Lower sample rate for maximum speed
-          '-ac', '1',                // Mono for speed
-          '-preset', 'ultrafast',
-          '-threads', '0',           // Use all available threads
-          '-f', 'mp3',
-          '-y',
-          outputPath
-        ]
-      },
-      // Strategy 2: iOS M4A optimized but fast
-      {
-        name: 'ios-m4a-fast',
-        args: [
-          '-i', inputPath,
-          '-vn', // No video
-          '-acodec', 'libmp3lame',
-          '-ab', '96k',
-          '-ar', '22050',
+          '-c:a', 'mp3',            // Use built-in mp3 encoder
+          '-b:a', '64k',
+          '-ar', '16000',
           '-ac', '1',
-          '-map', '0:a:0', // Map first audio stream
           '-threads', '0',
-          '-preset', 'ultrafast',
           '-f', 'mp3',
           '-y',
           outputPath
         ]
       },
-      // Strategy 3: AAC to MP3 fast conversion
+      // Strategy 2: Copy audio stream if already compatible
       {
-        name: 'aac-to-mp3-fast',
+        name: 'stream-copy',
         args: [
           '-i', inputPath,
-          '-c:a', 'libmp3lame',
+          '-c:a', 'copy',           // Try direct copy first
+          '-f', 'mp3',
+          '-y',
+          outputPath
+        ]
+      },
+      // Strategy 3: Force MP3 with different approach
+      {
+        name: 'force-mp3',
+        args: [
+          '-f', 'mp4',              // Force MP4 container read
+          '-i', inputPath,
+          '-vn',                    // No video
+          '-c:a', 'mp3',
           '-b:a', '96k',
           '-ar', '22050',
           '-ac', '1',
           '-threads', '0',
+          '-f', 'mp3',
+          '-y',
+          outputPath
+        ]
+      },
+      // Strategy 4: libmp3lame (original - try last)
+      {
+        name: 'libmp3lame-fallback',
+        args: [
+          '-i', inputPath,
+          '-acodec', 'libmp3lame',
+          '-ab', '64k',
+          '-ar', '16000',
+          '-ac', '1',
           '-preset', 'ultrafast',
+          '-threads', '0',
+          '-f', 'mp3',
+          '-y',
+          outputPath
+        ]
+      },
+      // Strategy 5: Raw AAC to MP3 conversion
+      {
+        name: 'aac-decode',
+        args: [
+          '-i', inputPath,
+          '-map', '0:a:0',          // Map first audio stream
+          '-c:a', 'mp3',
+          '-b:a', '96k',
+          '-ar', '22050',
+          '-ac', '1',
+          '-strict', 'experimental',
           '-f', 'mp3',
           '-y',
           outputPath
@@ -227,23 +289,42 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadat
       }
     ];
 
+    // Filter strategies based on available encoders
+    let availableStrategies = strategies;
+    
+    if (!encoderInfo?.hasLibmp3lame) {
+      logger.log('libmp3lame not available, filtering strategies');
+      availableStrategies = strategies.filter(s => !s.name.includes('libmp3lame'));
+    }
+    
+    if (!encoderInfo?.hasMp3 && !encoderInfo?.hasLibmp3lame) {
+      logger.error('No MP3 encoders available, this will likely fail');
+    }
     // Reorder strategies if iOS M4A detected
     if (isIosM4a) {
       logger.log('iOS M4A detected, prioritizing iOS-specific strategies');
+      // Move aac-decode strategy to front for iOS files
+      const aacStrategy = availableStrategies.find(s => s.name === 'aac-decode');
+      if (aacStrategy) {
+        availableStrategies.splice(availableStrategies.indexOf(aacStrategy), 1);
+        availableStrategies.unshift(aacStrategy);
+      }
     }
+
+    logger.log('Using strategies:', availableStrategies.map(s => s.name));
 
     let currentStrategy = 0;
     const attemptedStrategies = [];
 
     function tryConversion() {
-      if (currentStrategy >= strategies.length) {
+      if (currentStrategy >= availableStrategies.length) {
         logger.error('All conversion strategies failed', { attemptedStrategies });
         reject(new Error(`All conversion strategies failed. Attempted: ${attemptedStrategies.join(', ')}`));
         return;
       }
 
-      const strategy = strategies[currentStrategy];
-      logger.log(`Trying conversion strategy: ${strategy.name} (${currentStrategy + 1}/${strategies.length})`);
+      const strategy = availableStrategies[currentStrategy];
+      logger.log(`Trying conversion strategy: ${strategy.name} (${currentStrategy + 1}/${availableStrategies.length})`);
       attemptedStrategies.push(strategy.name);
       
       const ffmpegProcess = spawn(ffmpegPath, strategy.args, {
@@ -399,6 +480,9 @@ exports.handler = async (event) => {
       throw new Error("Downloaded file is empty");
     }
 
+    // Check available encoders first
+    const encoderInfo = await checkAvailableEncoders(ffmpegPath, logger);
+    
     // Probe the audio file to validate format and get metadata
     let metadata = null;
     try {
@@ -419,7 +503,7 @@ exports.handler = async (event) => {
     logger.log(`Starting conversion with ${remainingTime}ms remaining...`);
     
     // Convert the file with remaining time and metadata (save 500ms for cleanup)
-    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 500, metadata, logger);
+    await convertWithFFmpeg(ffmpegPath, inPath, outPath, remainingTime - 500, metadata, logger, encoderInfo);
 
     // Verify output
     if (!fs.existsSync(outPath)) {
