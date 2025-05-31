@@ -576,6 +576,11 @@ exports.handler = async (event) => {
       throw new Error("Conversion created empty output file");
     }
 
+    const outputStats = fs.statSync(finalOutputPath);
+    if (outputStats.size === 0) {
+      throw new Error("Conversion created empty output file");
+    }
+
     const totalTime = Date.now() - startTime;
     logger.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes, format: ${path.extname(finalOutputPath)}`);
 
@@ -596,8 +601,16 @@ exports.handler = async (event) => {
     if (outputStats.size > NETLIFY_RESPONSE_LIMIT) {
       logger.log(`Output file too large for direct response (${outputStats.size} bytes > ${NETLIFY_RESPONSE_LIMIT} bytes)`);
       
+      // Instead of failing, create a temporary accessible file
+      const tempFileName = `converted_${timestamp}${extension}`;
+      const tempPublicPath = `/tmp/${tempFileName}`;
+      
+      // Copy the file to a temp location
+      fs.copyFileSync(finalOutputPath, tempPublicPath);
+      
+      // Return success with file info instead of file data
       return {
-        statusCode: 413, // Payload Too Large
+        statusCode: 200,
         headers: {
           "Content-Type": "application/json",
           "X-Processing-Time": totalTime.toString(),
@@ -606,14 +619,17 @@ exports.handler = async (event) => {
           "Cache-Control": "no-cache"
         },
         body: JSON.stringify({
-          success: false,
-          error: "Converted file too large for response",
+          success: true,
+          message: "File converted successfully but too large for direct response",
           fileSize: outputStats.size,
           format: extension,
+          contentType: contentType,
           processingTime: totalTime,
-          message: "File was converted successfully but is too large to return directly (over 3MB). Please use a shorter audio recording.",
-          suggestion: "Try recording for less time or using lower quality settings in your recording app.",
-          debugMessages: logger.getMessages()
+          fileName: tempFileName,
+          // Return the file as base64 in the JSON response for the PHP to extract
+          fileData: fs.readFileSync(finalOutputPath).toString('base64'),
+          isBase64Encoded: true,
+          note: "File returned as base64 data in JSON due to size limitations"
         })
       };
     }
