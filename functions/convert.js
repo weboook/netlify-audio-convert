@@ -236,71 +236,65 @@ function convertWithFFmpeg(ffmpegPath, inputPath, outputPath, timeoutMs, metadat
       hasWav: encoderInfo?.hasWav
     });
 
-    // Strategy selection with fallbacks to any working audio format
+    // Strategy selection with very aggressive compression for large inputs
+    const isLargeInput = inputStats.size > 10 * 1024 * 1024; // Lower threshold - 10MB
+    const isVeryLargeInput = inputStats.size > 15 * 1024 * 1024;
+    
     const strategies = [
-      // Strategy 1: Try WAV first (most likely to work)
-      {
-        name: 'wav-pcm',
+      // Strategy 1: Ultra-compressed for large files (very aggressive)
+      ...(isLargeInput ? [{
+        name: 'ultra-compressed',
         args: [
           '-i', inputPath,
-          '-c:a', 'pcm_s16le',      // PCM is almost always available
-          '-ar', '16000',
+          '-c:a', 'aac',
+          '-b:a', isVeryLargeInput ? '16k' : '24k',  // Very low bitrate
+          '-ar', '8000',            // Phone quality sample rate
+          '-ac', '1',               // Mono
+          '-f', 'aac',
+          '-y',
+          outputPath.replace('.mp3', '.aac')
+        ]
+      }] : []),
+      // Strategy 2: Low quality WAV for large files
+      {
+        name: 'wav-pcm-compressed',
+        args: [
+          '-i', inputPath,
+          '-c:a', 'pcm_s16le',
+          '-ar', isLargeInput ? '8000' : '11025',  // Even lower sample rates
           '-ac', '1',
           '-f', 'wav',
           '-y',
           outputPath.replace('.mp3', '.wav')
         ]
       },
-      // Strategy 2: Try AAC (very common)
+      // Strategy 3: Very compressed AAC
       {
-        name: 'aac-output',
+        name: 'aac-compressed',
         args: [
           '-i', inputPath,
           '-c:a', 'aac',
-          '-b:a', '64k',
-          '-ar', '16000',
+          '-b:a', isLargeInput ? '16k' : '32k',  // Very low bitrate
+          '-ar', isLargeInput ? '8000' : '11025',
           '-ac', '1',
           '-f', 'aac',
           '-y',
           outputPath.replace('.mp3', '.aac')
         ]
       },
-      // Strategy 3: Force libmp3lame with explicit paths
+      // Strategy 4: Minimum quality MP3 (if libmp3lame available)
       {
-        name: 'libmp3lame-explicit',
+        name: 'libmp3lame-minimal',
         args: [
           '-i', inputPath,
           '-c:a', 'libmp3lame',
-          '-b:a', '64k',
-          '-ar', '16000',
+          '-b:a', isLargeInput ? '16k' : '24k',  // Extremely low bitrate
+          '-ar', '8000',
           '-ac', '1',
+          '-q:a', '9',              // Lowest quality setting
           '-f', 'mp3',
           '-y',
           outputPath
-        ]
-      },
-      // Strategy 4: Raw audio stream copy
-      {
-        name: 'raw-copy',
-        args: [
-          '-i', inputPath,
-          '-c:a', 'copy',
-          '-f', 'mp4',              // Keep in MP4 container
-          '-y',
-          outputPath.replace('.mp3', '.mp4')
-        ]
-      },
-      // Strategy 5: Last resort - any available codec
-      {
-        name: 'any-audio',
-        args: [
-          '-i', inputPath,
-          '-vn',                    // No video
-          '-ar', '16000',
-          '-ac', '1',
-          '-f', 'adts',             // ADTS AAC format
-          '-y',
-          outputPath.replace('.mp3', '.aac')
         ]
       }
     ];
@@ -518,7 +512,21 @@ exports.handler = async (event) => {
       throw new Error("Downloaded file is empty");
     }
 
-    // Check available encoders first
+    // Check if downloaded file is too large for any reasonable conversion
+    if (inputStats.size > 20 * 1024 * 1024) { // 20MB+ will almost certainly create output too large
+      throw new Error("Input file too large (over 20MB). Please use a shorter recording or compress the file before conversion.");
+    }
+
+    // Check if downloaded file is too large for Netlify response limits
+    if (inputStats.size > 15 * 1024 * 1024) { // 15MB+ input will likely create large output
+      logger.log(`Large input file detected (${inputStats.size} bytes), using maximum compression`);
+    }
+
+    // Early size estimation - if input is too large, warn about potential issues
+    const estimatedOutputSize = inputStats.size * 0.3; // Rough estimate with heavy compression
+    if (estimatedOutputSize > 3 * 1024 * 1024) {
+      logger.log(`Warning: Input file may produce output larger than response limit. Estimated: ${Math.round(estimatedOutputSize / 1024 / 1024)}MB`);
+    }
     const encoderInfo = await checkAvailableEncoders(ffmpegPath, logger);
     
     // Probe the audio file to validate format and get metadata
@@ -568,9 +576,11 @@ exports.handler = async (event) => {
       throw new Error("Conversion created empty output file");
     }
 
-    // Read and return the file
-    const buffer = fs.readFileSync(finalOutputPath);
-    
+    const outputStats = fs.statSync(finalOutputPath);
+    if (outputStats.size === 0) {
+      throw new Error("Conversion created empty output file");
+    }
+
     const totalTime = Date.now() - startTime;
     logger.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes, format: ${path.extname(finalOutputPath)}`);
 
@@ -585,6 +595,37 @@ exports.handler = async (event) => {
       contentType = "audio/mp4";
     }
 
+    // Check if output file is too large for Netlify response (much more conservative limit)
+    const NETLIFY_RESPONSE_LIMIT = 3 * 1024 * 1024; // 3MB to be very safe (accounting for base64 encoding overhead)
+    
+    if (outputStats.size > NETLIFY_RESPONSE_LIMIT) {
+      logger.log(`Output file too large for direct response (${outputStats.size} bytes > ${NETLIFY_RESPONSE_LIMIT} bytes)`);
+      
+      return {
+        statusCode: 413, // Payload Too Large
+        headers: {
+          "Content-Type": "application/json",
+          "X-Processing-Time": totalTime.toString(),
+          "X-Debug-Messages": JSON.stringify(logger.getMessages()),
+          "X-Output-Format": extension,
+          "Cache-Control": "no-cache"
+        },
+        body: JSON.stringify({
+          success: false,
+          error: "Converted file too large for response",
+          fileSize: outputStats.size,
+          format: extension,
+          processingTime: totalTime,
+          message: "File was converted successfully but is too large to return directly (over 3MB). Please use a shorter audio recording.",
+          suggestion: "Try recording for less time or using lower quality settings in your recording app.",
+          debugMessages: logger.getMessages()
+        })
+      };
+    }
+
+    // File is small enough to return directly
+    const buffer = fs.readFileSync(finalOutputPath);
+    
     return {
       statusCode: 200,
       headers: {
@@ -609,8 +650,11 @@ exports.handler = async (event) => {
     let statusCode = 500;
     
     if (err.message.includes('timeout') || err.message.includes('Timeout') || err.message.includes('Timedout')) {
-      errorMessage = "Processing timeout. File too large or complex for 10-second limit. Try a smaller file (max 25MB) or shorter audio.";
+      errorMessage = "Processing timeout. File too large or complex for 10-second limit. Try a much shorter audio recording (under 2 minutes).";
       statusCode = 504;
+    } else if (err.message.includes('Input file too large')) {
+      errorMessage = "Audio file too large (over 20MB). Please record shorter audio or compress the file first.";
+      statusCode = 413;
     } else if (err.message.includes('ENOTFOUND') || err.message.includes('network')) {
       errorMessage = "Could not download the source file. Check the URL and ensure it's accessible.";
       statusCode = 400;
