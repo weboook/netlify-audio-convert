@@ -2,5 +2,27 @@
   functions = "functions"
   command = "npm install"
 
+[functions]
+  # Global function settings
+  node_bundler = "esbuild"
+
 [functions."*"]
+  # Set timeout to maximum allowed (26 seconds for Netlify)
   timeout = 26
+  
+  # Increase memory for FFmpeg processing
+  memory = 1024
+
+# Optional: Add redirects for better error handling
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
+# Headers for CORS if needed
+[[headers]]
+  for = "/.netlify/functions/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Headers = "Content-Type"
+    Access-Control-Allow-Methods = "POST, OPTIONS"

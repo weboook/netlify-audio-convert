@@ -9,6 +9,7 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 exports.handler = async (event) => {
   let inPath, outPath;
   const startTime = Date.now();
+  const MAX_PROCESSING_TIME = 20000; // 20 seconds max
   
   try {
     const { url } = JSON.parse(event.body || '{}');
@@ -20,27 +21,40 @@ exports.handler = async (event) => {
 
     console.log('Starting conversion for:', url);
     
-    // Download the file
+    // Download the file with stricter limits
     const downloadStart = Date.now();
     const resp = await axios.get(url, { 
       responseType: 'stream',
-      timeout: 15000,
-      maxContentLength: 50 * 1024 * 1024
+      timeout: 10000, // Reduced timeout
+      maxContentLength: 25 * 1024 * 1024, // Reduced to 25MB max
+      maxRedirects: 3
     });
     
     await new Promise((resolve, reject) => {
       const writeStream = fs.createWriteStream(inPath);
       resp.data.pipe(writeStream);
       
+      const timeout = setTimeout(() => {
+        writeStream.destroy();
+        reject(new Error('Download timeout'));
+      }, 8000);
+      
       writeStream.on('finish', () => {
+        clearTimeout(timeout);
         const downloadTime = Date.now() - downloadStart;
         const fileSize = fs.statSync(inPath).size;
         console.log(`Download completed in ${downloadTime}ms, size: ${fileSize} bytes`);
         resolve();
       });
       
-      writeStream.on('error', reject);
-      resp.data.on('error', reject);
+      writeStream.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+      resp.data.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
     });
 
     // Verify input file
@@ -49,23 +63,33 @@ exports.handler = async (event) => {
       throw new Error("Downloaded file is empty");
     }
 
+    // Check if we have enough time left for conversion
+    const timeElapsed = Date.now() - startTime;
+    if (timeElapsed > MAX_PROCESSING_TIME * 0.6) {
+      throw new Error("Insufficient time remaining for conversion");
+    }
+
     console.log('Starting FFmpeg conversion...');
     const conversionStart = Date.now();
     
-    // More explicit FFmpeg conversion
+    // Optimized FFmpeg conversion with timeout
     await new Promise((resolve, reject) => {
-      ffmpeg(inPath)
-        .inputFormat('m4a')           // Explicitly set input format
-        .audioCodec('libmp3lame')     // MP3 codec
-        .noVideo()                    // Remove any video streams
-        .audioBitrate('128k')         // Standard bitrate
-        .audioFrequency(44100)        // Standard frequency
-        .audioChannels(2)             // Stereo
-        .format('mp3')                // Explicitly set output format
+      const conversionTimeout = setTimeout(() => {
+        reject(new Error('FFmpeg conversion timeout'));
+      }, MAX_PROCESSING_TIME - timeElapsed - 2000); // Leave 2s buffer
+
+      const ffmpegProcess = ffmpeg(inPath)
+        .inputFormat('m4a')
+        .audioCodec('libmp3lame')
+        .noVideo()
+        .audioBitrate('128k')        // Standard quality
+        .audioFrequency(44100)       
+        .audioChannels(2)            
+        .format('mp3')
         .outputOptions([
-          '-id3v2_version', '3',      // ID3v2.3 tags (more compatible)
-          '-write_id3v1', '1',        // Also write ID3v1 tags
-          '-map', '0:a:0'             // Map only the first audio stream
+          '-preset', 'ultrafast',    // Fastest encoding preset
+          '-q:a', '4',              // Good quality/speed balance
+          '-map', '0:a:0'           // Map first audio stream only
         ])
         .output(outPath)
         .on('start', (cmd) => {
@@ -77,15 +101,18 @@ exports.handler = async (event) => {
           }
         })
         .on('end', () => {
+          clearTimeout(conversionTimeout);
           const conversionTime = Date.now() - conversionStart;
           console.log(`Conversion completed in ${conversionTime}ms`);
           resolve();
         })
         .on('error', (err) => {
+          clearTimeout(conversionTimeout);
           console.error('FFmpeg error:', err.message);
           reject(new Error(`FFmpeg conversion failed: ${err.message}`));
-        })
-        .run();
+        });
+
+      ffmpegProcess.run();
     });
 
     // Verify output file exists and has content
@@ -98,24 +125,21 @@ exports.handler = async (event) => {
       throw new Error("FFmpeg created empty output file");
     }
 
-    // Read a few bytes to verify it's actually MP3
-    const buffer = fs.readFileSync(outPath);
-    const firstBytes = buffer.slice(0, 3);
-    
-    // Check for MP3 signatures
-    const isMP3 = (
-      (firstBytes[0] === 0xFF && (firstBytes[1] & 0xE0) === 0xE0) || // MP3 frame header
-      (firstBytes.toString() === 'ID3')                               // ID3 tag
-    );
-
-    if (!isMP3) {
-      console.error('Output file does not appear to be valid MP3');
-      console.error('First 10 bytes:', buffer.slice(0, 10));
-      throw new Error("Conversion produced invalid MP3 file");
+    // Quick validation - just check file size is reasonable
+    if (outputStats.size < 1000) {
+      throw new Error("Output file suspiciously small");
     }
 
+    // Read the file
+    const buffer = fs.readFileSync(outPath);
+    
     const totalTime = Date.now() - startTime;
     console.log(`Total processing: ${totalTime}ms, output: ${outputStats.size} bytes`);
+
+    // Check if we're approaching timeout
+    if (totalTime > MAX_PROCESSING_TIME * 0.9) {
+      console.warn('Conversion completed close to timeout limit');
+    }
 
     return {
       statusCode: 200,
@@ -123,7 +147,8 @@ exports.handler = async (event) => {
         "Content-Type": "audio/mpeg",
         "Content-Disposition": "attachment; filename=\"converted.mp3\"",
         "Content-Length": buffer.length.toString(),
-        "X-Processing-Time": totalTime.toString()
+        "X-Processing-Time": totalTime.toString(),
+        "Cache-Control": "no-cache"
       },
       body: buffer.toString('base64'),
       isBase64Encoded: true,
@@ -133,20 +158,37 @@ exports.handler = async (event) => {
     const totalTime = Date.now() - startTime;
     console.error(`Error after ${totalTime}ms:`, err.message);
     
+    // Return more specific error info
+    let errorMessage = err.message;
+    if (err.message.includes('timeout') || err.message.includes('Timeout')) {
+      errorMessage = "File too large or conversion taking too long. Try a smaller file.";
+    } else if (err.message.includes('ENOTFOUND') || err.message.includes('network')) {
+      errorMessage = "Could not download the source file. Check the URL.";
+    }
+    
     return { 
-      statusCode: 500, 
+      statusCode: err.message.includes('timeout') ? 504 : 500,
+      headers: {
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify({ 
-        error: err.message,
-        processingTime: totalTime
+        error: errorMessage,
+        processingTime: totalTime,
+        originalError: err.message
       }) 
     };
   } finally {
-    // Cleanup
-    try {
-      if (inPath && fs.existsSync(inPath)) fs.unlinkSync(inPath);
-      if (outPath && fs.existsSync(outPath)) fs.unlinkSync(outPath);
-    } catch (e) {
-      console.error('Cleanup error:', e.message);
+    // Cleanup - more aggressive cleanup
+    const cleanupFiles = [inPath, outPath];
+    for (const filePath of cleanupFiles) {
+      try {
+        if (filePath && fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          console.log('Cleaned up:', filePath);
+        }
+      } catch (e) {
+        console.error('Cleanup error for', filePath, ':', e.message);
+      }
     }
   }
 };
